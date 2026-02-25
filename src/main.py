@@ -22,16 +22,43 @@ class SpeechToTextAgent:
         self.vad: Optional[VoiceActivityDetector] = None
         self.recognizer: Optional[SpeechRecognizer] = None
         self.text_injector: Optional[TextInjector] = None
-        
+
         self.is_running = False
         self.is_listening = False
+        self._model_ready = False
         self._processing_thread: Optional[threading.Thread] = None
         self._audio_buffer = AudioBuffer(
             max_duration_ms=self.config.get('silence_timeout_ms', 2000)
         )
-        
+
         self.on_status_change: Optional[Callable[[str], None]] = None
         self.on_transcription: Optional[Callable[[str], None]] = None
+
+    # ── eager model preload ───────────────────────────────────────────────────
+
+    def preload_model(self):
+        """Load the Vosk model in a background thread immediately on startup.
+        
+        This prevents the first 'Start Listening' click from blocking while
+        Vosk initialises, which can take several seconds.
+        """
+        threading.Thread(target=self._preload_model_worker, daemon=True).start()
+
+    def _preload_model_worker(self):
+        self._notify_status("loading")
+        try:
+            logger.info("Preloading Vosk model …")
+            self.recognizer = SpeechRecognizer(
+                model_path=self.config.get('model_path', 'model'),
+                sample_rate=self.config.get('sample_rate', 16000)
+            )
+            self._model_ready = True
+            logger.info("Vosk model preloaded – ready to listen")
+        except Exception as e:
+            logger.error(f"Model preload failed: {e}")
+            self._model_ready = False
+        finally:
+            self._notify_status("stopped")
 
     def start(self):
         if self.is_running:
@@ -92,17 +119,19 @@ class SpeechToTextAgent:
             chunk_size=self.config.get('chunk_size', 1024),
             sample_rate=self.config.get('sample_rate', 16000)
         )
-        
+
         self.vad = VoiceActivityDetector(
             aggressiveness=self.config.get('vad_aggressiveness', 2),
             sample_rate=self.config.get('sample_rate', 16000)
         )
-        
-        self.recognizer = SpeechRecognizer(
-            model_path=self.config.get('model_path', 'model'),
-            sample_rate=self.config.get('sample_rate', 16000)
-        )
-        
+
+        # Reuse the already-loaded recognizer if preload_model() was called.
+        if not self._model_ready or self.recognizer is None:
+            self.recognizer = SpeechRecognizer(
+                model_path=self.config.get('model_path', 'model'),
+                sample_rate=self.config.get('sample_rate', 16000)
+            )
+
         self.text_injector = TextInjector(
             typing_delay=self.config.get('typing_delay', 0.01)
         )

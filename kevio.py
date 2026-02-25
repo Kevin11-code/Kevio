@@ -44,12 +44,12 @@ class KevioApp:
         )
         self.tray.start()
 
-        # Build UI
+        # Build UI first so status callbacks land on the ready widget
         self.ui = KevioUI(on_toggle=self._on_toggle, on_exit=self._on_exit)
 
-        # Start the speech agent in a background thread
-        agent_thread = threading.Thread(target=self._run_agent, daemon=True)
-        agent_thread.start()
+        # Kick-off model preload after the mainloop has started so the
+        # "Loading model …" status update lands on an already-running Tk loop.
+        self.ui.root.after(50, self.agent.preload_model)
 
         # Global hotkey listener (daemon thread)
         self._start_hotkey_listener()
@@ -90,7 +90,7 @@ class KevioApp:
     # ── Callbacks ──────────────────────────────────────────────────────────────
 
     def _on_status_change(self, status: str):
-        logger.info(f"Status changed: {status}")
+        # logger.info(f"Status changed: {status}")
         if self.tray:
             self.tray.update_status(status)
         if self.ui:

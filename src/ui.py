@@ -1,42 +1,49 @@
 """
-Kevio – compact floating control panel.
+Kevio – pill-shaped floating control panel (Windows 11 Fluent style).
 
-Structure  (260 × 130 px):
-  ┌──────────────────────────┐
-  │  🎙 Kevio          _  ×  │  ← drag zone / title bar
-  ├──────────────────────────┤
-  │   ●  Listening …         │  ← status row
-  │  ╔══════════════════════╗ │
-  │  ║   ■  Stop Listening  ║ │  ← action button
-  │  ╚══════════════════════╝ │
-  └──────────────────────────┘
+Layout (380 × 56 px):
+  ╭─────────────────────────────────────────────────╮
+  │  [logo]  ┌──────────────────────┐  ···   ✕    │
+  │          │  ●  Start Listening  │  drag zone   │
+  │          └──────────────────────┘              │
+  ╰─────────────────────────────────────────────────╯
 """
 
-import logging
+import ctypes
+import ctypes.wintypes
 import math
+import os
 import tkinter as tk
 from tkinter import font as tkfont
 from typing import Callable
 
-logger = logging.getLogger(__name__)
+from PIL import Image, ImageTk
 
-# ── palette ───────────────────────────────────────────────────────────────────
-BG        = "#0f1117"
-SURFACE   = "#181c27"
-HEADER    = "#13161f"
-BORDER    = "#252d3f"
-GREEN     = "#22c55e"
-GREEN_DK  = "#15803d"
-RED       = "#ef4444"
-RED_DK    = "#b91c1c"
-AMBER     = "#f59e0b"
-BLUE      = "#3b82f6"
-TEXT_PRI  = "#f1f5f9"
-TEXT_SEC  = "#64748b"
-TEXT_MUT  = "#334155"
+# ── Windows 11 Fluent Dark tokens ────────────────────────────────────────────
+BG_SURFACE   = "#1e1e1e"
+DRAG_BOX_BG  = "#2a2a2a"  # slightly lighter box for the status area
+DRAG_BOX_BD  = "#3d3d3d"  # subtle border on the drag handle box
+ACCENT       = "#4cc2ff"
+SUCCESS      = "#22c55e"
+WARNING      = "#f59e0b"
+DANGER       = "#ef4444"
+MUTED        = "#555555"
+TEXT_PRI     = "#ffffff"
+TEXT_SEC     = "#8a8a8a"
 
-W = 260
-H = 130
+# Window dimensions
+W      = 380
+H      = 56
+RADIUS = 28   # full pill = H/2
+
+# Status → (button label, dot color, interactive?)
+_STATUS_MAP = {
+    "loading":    ("Loading model…",  ACCENT,  False),
+    "stopped":    ("Start Listening", SUCCESS, True),
+    "listening":  ("Stop Listening",  DANGER,  True),
+    "paused":     ("Start Listening", WARNING, True),
+    "processing": ("Processing…",     ACCENT,  False),
+}
 
 
 class KevioUI:
@@ -45,224 +52,263 @@ class KevioUI:
         self.on_exit   = on_exit
 
         self.status        = "stopped"
-        self._pulse_run    = False
-        self._pulse_angle  = 0.0
-        self._drag_ox      = 0
-        self._drag_oy      = 0
-        self._minimized    = False
+        self._pulse_active = False
+        self._pulse_t      = 0.0
+        self._dot_base_rgb = (0x55, 0x55, 0x55)
+
+        self._drag_x = 0
+        self._drag_y = 0
 
         self._build()
 
-    # ── window ────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Window
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _build(self):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+
         self.root = tk.Tk()
-        self.root.title("Kevio")
-        self.root.configure(bg=BG)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.97)
-        self.root.resizable(False, False)
+        self.root.configure(bg="black")
 
-        self._place(W, H)
+        self._place()
 
-        self._f_brand  = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-        self._f_status = tkfont.Font(family="Segoe UI", size=9)
-        self._f_btn    = tkfont.Font(family="Segoe UI", size=9,  weight="bold")
-        self._f_ctrl   = tkfont.Font(family="Segoe UI", size=10)
+        # Canvas paints the pill shape; Tk frame sits on top of it
+        self.canvas = tk.Canvas(
+            self.root, width=W, height=H,
+            bg="black", highlightthickness=0,
+        )
+        self.canvas.pack()
 
-        self._build_chrome()
-        self._build_body()
+        # Drop shadow
+        self._pill(3, 5, W - 3, H - 1, RADIUS, fill="#111111")
+        # Main surface
+        self._pill_id = self._pill(0, 0, W, H, RADIUS, fill=BG_SURFACE)
 
-    def _place(self, w, h):
+        self._load_assets()
+        self._build_content()
+
+        # Apply Win11 rounded corners AFTER widgets are mapped
+        self.root.update_idletasks()
+        self._apply_win11_corners()
+
+    def _place(self):
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        x  = (sw - w) // 2
-        y  = sh - h - 52
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        x  = (sw - W) // 2
+        y  = sh - H - 80
+        self.root.geometry(f"{W}x{H}+{x}+{y}")
 
-    # ── chrome (title bar) ────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Pill helper
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _build_chrome(self):
-        self._hdr = tk.Frame(self.root, bg=HEADER, height=34)
-        self._hdr.pack(fill="x", side="top")
-        self._hdr.pack_propagate(False)
+    def _pill(self, x1, y1, x2, y2, r, **kw):
+        pts = [
+            x1 + r, y1,   x2 - r, y1,
+            x2,     y1,   x2,     y1 + r,
+            x2,     y2 - r, x2,   y2,
+            x2 - r, y2,   x1 + r, y2,
+            x1,     y2,   x1,     y2 - r,
+            x1,     y1 + r, x1,   y1,
+        ]
+        return self.canvas.create_polygon(pts, smooth=True, **kw)
 
-        # brand
-        brand = tk.Label(
-            self._hdr, text="🎙  Kevio",
-            bg=HEADER, fg=TEXT_PRI,
-            font=self._f_brand, anchor="w", padx=12
-        )
-        brand.pack(side="left", fill="y")
+    # ─────────────────────────────────────────────────────────────────────────
+    # Assets
+    # ─────────────────────────────────────────────────────────────────────────
 
-        # window controls – right side
-        ctrl_frame = tk.Frame(self._hdr, bg=HEADER)
-        ctrl_frame.pack(side="right", fill="y", padx=6)
+    def _load_assets(self):
+        self._logo_img = None
+        try:
+            path = os.path.join(os.getcwd(), "assets", "kevio.png")
+            if os.path.exists(path):
+                img = Image.open(path).convert("RGBA")
+                img.thumbnail((70, 70), Image.LANCZOS)   # aspect-safe resize
+                self._logo_img = ImageTk.PhotoImage(img)
+        except Exception as e:
+            print(f"Logo load error: {e}")
 
-        self._min_btn = self._ctrl_btn(ctrl_frame, "−", self._toggle_minimize,
-                                       hover_fg="#f0f0f0")
-        self._min_btn.pack(side="left", padx=(0, 2))
+    # ─────────────────────────────────────────────────────────────────────────
+    # Content
+    # ─────────────────────────────────────────────────────────────────────────
 
-        close_btn = self._ctrl_btn(ctrl_frame, "✕", self._exit,
-                                   hover_fg=RED)
-        close_btn.pack(side="left")
+    def _build_content(self):
+        f_label = tkfont.Font(family="Segoe UI", size=10, weight="normal")
+        f_close = tkfont.Font(family="Segoe UI", size=9)
 
-        # separator
-        sep = tk.Frame(self.root, bg=BORDER, height=1)
-        sep.pack(fill="x")
+        # Overlay frame fills the whole pill (transparent background = pill color)
+        row = tk.Frame(self.root, bg=BG_SURFACE, width=W, height=H)
+        row.place(x=0, y=0)
+        row.pack_propagate(False)
 
-        # make entire header draggable
-        for w in (self._hdr, brand, ctrl_frame):
-            w.bind("<ButtonPress-1>",  self._drag_start)
-            w.bind("<B1-Motion>",      self._drag_move)
+        # ── left padding ─────────────────────────────────────────────────────
+        tk.Frame(row, bg=BG_SURFACE, width=15).pack(side="left")
 
-    def _ctrl_btn(self, parent, text, cmd, hover_fg=TEXT_PRI):
-        lbl = tk.Label(
-            parent, text=text,
-            bg=HEADER, fg=TEXT_SEC,
-            font=self._f_ctrl, width=2, cursor="hand2"
-        )
-        lbl.bind("<Button-1>", lambda _e: cmd())
-        lbl.bind("<Enter>",    lambda _e: lbl.config(fg=hover_fg))
-        lbl.bind("<Leave>",    lambda _e: lbl.config(fg=TEXT_SEC))
-        return lbl
-
-    # ── body ──────────────────────────────────────────────────────────────────
-
-    def _build_body(self):
-        self._body = tk.Frame(self.root, bg=SURFACE)
-        self._body.pack(fill="both", expand=True)
-
-        # ── status row ────────────────────────────────────────────────────────
-        status_row = tk.Frame(self._body, bg=SURFACE)
-        status_row.pack(fill="x", padx=14, pady=(10, 6))
-
-        # animated dot canvas
-        self._dot_cv = tk.Canvas(
-            status_row, width=12, height=12,
-            bg=SURFACE, highlightthickness=0
-        )
-        self._dot_cv.pack(side="left")
-        self._draw_dot(1.0)
-
-        self._status_var = tk.StringVar(value="Idle  –  press Start or F9")
-        status_lbl = tk.Label(
-            status_row,
-            textvariable=self._status_var,
-            bg=SURFACE, fg=TEXT_SEC,
-            font=self._f_status, anchor="w", padx=6
-        )
-        status_lbl.pack(side="left", fill="x", expand=True)
-
-        # ── toggle button ─────────────────────────────────────────────────────
-        self._btn_var = tk.StringVar(value="▶   Start Listening")
-        self._btn = tk.Button(
-            self._body,
-            textvariable=self._btn_var,
-            command=self.on_toggle,
-            bg=GREEN, fg="#ffffff",
-            activebackground=GREEN_DK, activeforeground="#ffffff",
-            font=self._f_btn,
-            relief="flat", bd=0,
-            pady=9, cursor="hand2",
-        )
-        self._btn.pack(fill="x", padx=14, pady=(0, 12))
-
-    # ── status dot ────────────────────────────────────────────────────────────
-
-    def _dot_color(self):
-        return {
-            "listening":  GREEN,
-            "paused":     AMBER,
-            "processing": BLUE,
-        }.get(self.status, TEXT_MUT)
-
-    def _draw_dot(self, scale: float = 1.0):
-        c  = self._dot_cv
-        cx = cy = 6
-        r  = max(1, int(5 * scale))
-        c.delete("all")
-        color = self._dot_color()
-        if self.status == "listening":
-            c.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
-                          fill="", outline=color, width=1)
-        c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                      fill=color, outline="")
-
-    # ── dot pulse animation ───────────────────────────────────────────────────
-
-    def _start_pulse(self):
-        if self._pulse_run:
-            return
-        self._pulse_run = True
-        self._tick()
-
-    def _stop_pulse(self):
-        self._pulse_run = False
-        self._draw_dot(1.0)
-
-    def _tick(self):
-        if not self._pulse_run:
-            return
-        self._pulse_angle += 0.12
-        self._draw_dot(0.7 + 0.3 * math.sin(self._pulse_angle))
-        self.root.after(40, self._tick)
-
-    # ── minimize  ─────────────────────────────────────────────────────────────
-
-    def _toggle_minimize(self):
-        self._minimized = not self._minimized
-        if self._minimized:
-            self._body.pack_forget()
-            self.root.geometry(f"{W}x34")
-            self._min_btn.config(text="□")
+        # ── logo (draggable) ─────────────────────────────────────────────────
+        if self._logo_img:
+            lbl_logo = tk.Label(
+                row, image=self._logo_img,
+                bg=BG_SURFACE, bd=0, padx=10, pady=0,
+                cursor="fleur",   # move cursor hints draggable
+            )
         else:
-            self._body.pack(fill="both", expand=True)
-            self.root.geometry(f"{W}x{H}")
-            self._min_btn.config(text="−")
+            lbl_logo = tk.Label(
+                row, text="🎙",
+                bg=BG_SURFACE, fg=ACCENT,
+                font=tkfont.Font(size=15),
+                cursor="fleur",
+            )
+        lbl_logo.pack(side="left", padx=(0, 8))
+        self._bind_drag(lbl_logo)
 
-    # ── dragging ──────────────────────────────────────────────────────────────
+        # ── left center spacer ───────────────────────────────────────────────
+        left_spacer = tk.Frame(row, bg=BG_SURFACE)
+        left_spacer.pack(side="left", fill="x", expand=True)
+        self._bind_drag(left_spacer)
+
+        # ── status box (drag handle with visible border) ──────────────────────
+        # This box is the primary drag handle AND houses dot + label.
+        drag_box = tk.Frame(
+            row,
+            bg=DRAG_BOX_BG,
+            highlightbackground=DRAG_BOX_BD,
+            highlightthickness=1,
+            padx=7, pady=0,
+            cursor="fleur",
+        )
+        drag_box.pack(side="left", ipady=3)
+        self._bind_drag(drag_box)
+
+        # Animated dot inside box
+        self._dot_cv = tk.Canvas(
+            drag_box, width=10, height=10,
+            bg=DRAG_BOX_BG, highlightthickness=0,
+            cursor="fleur",
+        )
+        self._dot_cv.pack(side="left", padx=(0, 7))
+        self._dot_item = self._dot_cv.create_oval(1, 1, 9, 9,
+                                                   fill=MUTED, outline="")
+        self._bind_drag(self._dot_cv)
+
+        # Action label inside box
+        self._btn_var = tk.StringVar(value="Start Listening")
+        self._btn_lbl = tk.Label(
+            drag_box,
+            textvariable=self._btn_var,
+            bg=DRAG_BOX_BG, fg=TEXT_PRI,
+            font=f_label,
+            width=15, anchor="w",
+            cursor="hand2",
+        )
+        self._btn_lbl.pack(side="left")
+        self._btn_lbl.bind("<Button-1>", self._on_btn_click)
+        self._btn_lbl.bind("<Enter>",    lambda _e: self._btn_hover(True))
+        self._btn_lbl.bind("<Leave>",    lambda _e: self._btn_hover(False))
+
+        # ── right center spacer ──────────────────────────────────────────────
+        right_spacer = tk.Frame(row, bg=BG_SURFACE)
+        right_spacer.pack(side="left", fill="x", expand=True)
+        self._bind_drag(right_spacer)
+
+        # ── close button ──────────────────────────────────────────────────────
+        self._close_lbl = tk.Label(
+            row, text="✕",
+            bg=BG_SURFACE, fg=TEXT_SEC,
+            font=f_close, width=2,
+            cursor="hand2",
+        )
+        self._close_lbl.pack(side="left")
+        self._close_lbl.bind("<Button-1>", lambda _e: self._exit())
+        self._close_lbl.bind("<Enter>",    lambda _e: self._close_lbl.config(fg=DANGER))
+        self._close_lbl.bind("<Leave>",    lambda _e: self._close_lbl.config(fg=TEXT_SEC))
+
+        # ── right padding ─────────────────────────────────────────────────────
+        tk.Frame(row, bg=BG_SURFACE, width=12).pack(side="left")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Drag helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _bind_drag(self, widget):
+        widget.bind("<ButtonPress-1>", self._drag_start)
+        widget.bind("<B1-Motion>",     self._drag_move)
 
     def _drag_start(self, e):
-        self._drag_ox = e.x_root - self.root.winfo_x()
-        self._drag_oy = e.y_root - self.root.winfo_y()
+        self._drag_x = e.x_root - self.root.winfo_x()
+        self._drag_y = e.y_root - self.root.winfo_y()
 
     def _drag_move(self, e):
-        self.root.geometry(f"+{e.x_root - self._drag_ox}+{e.y_root - self._drag_oy}")
+        self.root.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
 
-    # ── public API ────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # Button helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_btn_click(self, _e=None):
+        if self.status not in ("loading", "processing"):
+            self.on_toggle()
+
+    def _btn_hover(self, entering: bool):
+        if self.status in ("loading", "processing"):
+            return
+        self._btn_lbl.config(fg=ACCENT if entering else TEXT_PRI)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Windows 11 – DWM rounded corners
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _apply_win11_corners(self):
+        """Ask DWM to round the window corners (Win 11 only, silently fails on Win 10)."""
+        try:
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWCP_ROUND = 2
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            # If overrideredirect, GetParent returns 0 — use winfo_id directly
+            if hwnd == 0:
+                hwnd = self.root.winfo_id()
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(ctypes.c_int(DWMWCP_ROUND)),
+                ctypes.sizeof(ctypes.c_int),
+            )
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public status API
+    # ─────────────────────────────────────────────────────────────────────────
 
     def update_status(self, status: str):
-        """Thread-safe status update."""
+        """Thread-safe status push."""
         self.root.after(0, self._apply_status, status)
 
     def _apply_status(self, status: str):
         self.status = status
+        label, dot_color, interactive = _STATUS_MAP.get(status, _STATUS_MAP["stopped"])
 
-        cfg = {
-            "listening":  ("Listening …",           GREEN,   "■   Stop Listening",  RED,   RED_DK),
-            "paused":     ("Paused",                 AMBER,   "▶   Resume",          GREEN, GREEN_DK),
-            "processing": ("Processing …",           BLUE,    "■   Stop",            RED,   RED_DK),
-            "stopped":    ("Idle  –  press Start or F9", TEXT_SEC, "▶   Start Listening", GREEN, GREEN_DK),
-        }.get(status, ("Idle  –  press Start or F9", TEXT_SEC, "▶   Start Listening", GREEN, GREEN_DK))
+        self._btn_var.set(label)
+        self._btn_lbl.config(
+            cursor="hand2" if interactive else "watch",
+            fg=TEXT_PRI,
+        )
 
-        st_text, st_color, btn_text, btn_bg, btn_abg = cfg
-        self._status_var.set(st_text)
+        # Store base RGB so pulse doesn't drift toward black
+        self._dot_base_rgb = (
+            int(dot_color[1:3], 16),
+            int(dot_color[3:5], 16),
+            int(dot_color[5:7], 16),
+        )
+        self._dot_cv.itemconfig(self._dot_item, fill=dot_color)
 
-        # update status label color
-        for w in self._body.winfo_children():
-            if isinstance(w, tk.Frame):
-                for c in w.winfo_children():
-                    if isinstance(c, tk.Label):
-                        c.config(fg=st_color)
-                        break
-                break
-
-        self._btn_var.set(btn_text)
-        self._btn.config(bg=btn_bg, activebackground=btn_abg)
-
-        if status == "listening":
+        if status in ("listening", "loading"):
             self._start_pulse()
         else:
             self._stop_pulse()
@@ -271,14 +317,49 @@ class KevioUI:
         """No log panel – kept for API compat."""
         pass
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Pulse animation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _start_pulse(self):
+        if self._pulse_active:
+            return
+        self._pulse_active = True
+        self._pulse_t = 0.0
+        self._tick_pulse()
+
+    def _stop_pulse(self):
+        self._pulse_active = False
+        r, g, b = self._dot_base_rgb
+        self._dot_cv.itemconfig(self._dot_item, fill=f"#{r:02x}{g:02x}{b:02x}")
+
+    def _tick_pulse(self):
+        if not self._pulse_active:
+            return
+        self._pulse_t += 0.10
+        alpha = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(self._pulse_t))
+        r, g, b = self._dot_base_rgb
+        self._dot_cv.itemconfig(
+            self._dot_item,
+            fill=f"#{int(r*alpha):02x}{int(g*alpha):02x}{int(b*alpha):02x}",
+        )
+        self.root.after(40, self._tick_pulse)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _exit(self):
-        self._pulse_run = False
-        self.on_exit()
+        self._pulse_active = False
+        if self.on_exit:
+            self.on_exit()
 
     def run(self):
         self.root.mainloop()
 
     def quit(self):
+        """Called by KevioApp.stop() to tear down the window."""
+        self._pulse_active = False
         try:
             self.root.quit()
             self.root.destroy()
